@@ -56,6 +56,29 @@ python sft_12hz.py \
   --speaker_name speaker_test
 ```
 
+### 4) New Way
+
+```
+# Example 1: Using Hugging Face dataset with default field mapping
+python finetuning/prepare_data.py \
+  --input_source "your-dataset/id" \
+  --output_jsonl "prepared_data.jsonl" \
+  --split "train"
+
+# Example 2: With custom field mapping
+python finetuning/prepare_data.py \
+  --input_source "your-dataset/id" \
+  --output_jsonl "prepared_data.jsonl" \
+  --field_mapping '{"audio_path": "audio", "transcript": "text", "reference_audio": "ref_audio"}' \
+  --split "train"
+
+# Then run fine-tuning
+python finetuning/sft_12hz.py \
+  --train_jsonl "prepared_data.jsonl" \
+  --output_model_path "output_model"
+```
+
+
 Checkpoints will be written to:
 - `output/checkpoint-epoch-0`
 - `output/checkpoint-epoch-1`
