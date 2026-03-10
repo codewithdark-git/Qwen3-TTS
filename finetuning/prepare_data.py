@@ -16,56 +16,187 @@
 
 import argparse
 import json
+from pathlib import Path
+from typing import List, Dict, Any
 
+from datasets import load_dataset
 from qwen_tts import Qwen3TTSTokenizer
 
 BATCH_INFER_NUM = 32
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
-    parser.add_argument("--input_jsonl", type=str, required=True)
-    parser.add_argument("--output_jsonl", type=str, required=True)
-    args = parser.parse_args()
+def load_data_from_source(input_source: str, split: str = "train") -> List[Dict[str, Any]]:
+    """
+    Load data from either a local JSONL file or a Hugging Face dataset.
+    
+    Args:
+        input_source: Either a path to a local JSONL file or a Hugging Face dataset ID
+        split: Dataset split to load (default: "train")
+    
+    Returns:
+        List of dictionaries containing the data
+    """
+    # Check if it's a local file
+    if Path(input_source).exists() and input_source.endswith('.jsonl'):
+        print(f"Loading from local JSONL file: {input_source}")
+        with open(input_source, 'r') as f:
+            data = [json.loads(line.strip()) for line in f if line.strip()]
+        return data
+    else:
+        # Try to load from Hugging Face
+        print(f"Loading from Hugging Face dataset: {input_source} (split: {split})")
+        try:
+            dataset = load_dataset(input_source, split=split)
+            # Convert to list of dictionaries
+            data = [dict(row) for row in dataset]
+            print(f"Loaded {len(data)} samples from Hugging Face dataset")
+            return data
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load data from '{input_source}'. "
+                f"Please provide either a valid local JSONL file path or a Hugging Face dataset ID. "
+                f"Error: {str(e)}"
+            )
 
+def validate_data_format(data: List[Dict[str, Any]]) -> None:
+    """
+    Validate that the data has the required fields.
+    
+    Args:
+        data: List of data dictionaries
+        
+    Raises:
+        ValueError: If required fields are missing
+    """
+    required_fields = {"audio", "text", "ref_audio"}
+    
+    if not data:
+        raise ValueError("Data is empty")
+    
+    first_item = data[0]
+    missing_fields = required_fields - set(first_item.keys())
+    
+    if missing_fields:
+        raise ValueError(
+            f"Data is missing required fields: {missing_fields}. "
+            f"Each item must contain 'audio', 'text', and 'ref_audio'. "
+            f"Available fields: {set(first_item.keys())}"
+        )
+
+def prepare_data(input_source: str, output_jsonl: str, device: str, 
+                 tokenizer_model_path: str, split: str = "train") -> None:
+    """
+    Main function to prepare data by encoding audio files.
+    
+    Args:
+        input_source: Path to local JSONL or Hugging Face dataset ID
+        output_jsonl: Path to output JSONL file
+        device: Device to use for tokenizer
+        tokenizer_model_path: Path to the tokenizer model
+        split: Dataset split to load (only for HF datasets)
+    """
+    # Load data
+    total_lines = load_data_from_source(input_source, split)
+    
+    # Validate format
+    validate_data_format(total_lines)
+    
+    print(f"Loaded {len(total_lines)} samples")
+    
+    # Initialize tokenizer
+    print("Loading tokenizer...")
     tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        args.tokenizer_model_path,
-        device_map=args.device,
+        tokenizer_model_path,
+        device_map=device,
     )
-
-    total_lines = open(args.input_jsonl).readlines()
-    total_lines = [json.loads(line.strip()) for line in total_lines]
-
+    
+    # Process data in batches
     final_lines = []
     batch_lines = []
     batch_audios = []
-    for line in total_lines:
-
+    
+    print("Encoding audio files...")
+    for idx, line in enumerate(total_lines):
+        if idx % 10 == 0:
+            print(f"Processing: {idx}/{len(total_lines)}")
+        
         batch_lines.append(line)
         batch_audios.append(line['audio'])
-
+        
         if len(batch_lines) >= BATCH_INFER_NUM:
             enc_res = tokenizer_12hz.encode(batch_audios)
-            for code, line in zip(enc_res.audio_codes, batch_lines):
-                line['audio_codes'] = code.cpu().tolist()
-                final_lines.append(line)
+            for code, batch_line in zip(enc_res.audio_codes, batch_lines):
+                batch_line['audio_codes'] = code.cpu().tolist()
+                final_lines.append(batch_line)
             batch_lines.clear()
             batch_audios.clear()
-
+    
+    # Process remaining items
     if len(batch_audios) > 0:
         enc_res = tokenizer_12hz.encode(batch_audios)
-        for code, line in zip(enc_res.audio_codes, batch_lines):
-            line['audio_codes'] = code.cpu().tolist()
-            final_lines.append(line)
+        for code, batch_line in zip(enc_res.audio_codes, batch_lines):
+            batch_line['audio_codes'] = code.cpu().tolist()
+            final_lines.append(batch_line)
         batch_lines.clear()
         batch_audios.clear()
+    
+    # Write output
+    print(f"Writing {len(final_lines)} samples to {output_jsonl}")
+    final_lines_json = [json.dumps(line, ensure_ascii=False) for line in final_lines]
+    
+    with open(output_jsonl, 'w') as f:
+        for line in final_lines_json:
+            f.write(line + '\n')
+    
+    print("Data preparation complete!")
 
-    final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
-
-    with open(args.output_jsonl, 'w') as f:
-        for line in final_lines:
-            f.writelines(line + '\n')
+def main():
+    parser = argparse.ArgumentParser(
+        description="Prepare data for Qwen3-TTS fine-tuning from local JSONL or Hugging Face datasets"
+    )
+    parser.add_argument(
+        "--device", 
+        type=str, 
+        default="cuda:0",
+        help="Device to use for encoding (default: cuda:0)"
+    )
+    parser.add_argument(
+        "--tokenizer_model_path", 
+        type=str, 
+        default="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+        help="Path to the tokenizer model"
+    )
+    parser.add_argument(
+        "--input_source", 
+        type=str, 
+        required=True,
+        help="Input source: either path to local JSONL file or Hugging Face dataset ID"
+    )
+    parser.add_argument(
+        "--output_jsonl", 
+        type=str, 
+        required=True,
+        help="Path to output JSONL file with audio codes"
+    )
+    parser.add_argument(
+        "--split", 
+        type=str, 
+        default="train",
+        help="Dataset split to load when using Hugging Face datasets (default: train)"
+    )
+    
+    args = parser.parse_args()
+    
+    try:
+        prepare_data(
+            input_source=args.input_source,
+            output_jsonl=args.output_jsonl,
+            device=args.device,
+            tokenizer_model_path=args.tokenizer_model_path,
+            split=args.split
+        )
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
