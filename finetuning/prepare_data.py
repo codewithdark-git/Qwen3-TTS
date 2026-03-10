@@ -67,7 +67,7 @@ def validate_data_format(data: List[Dict[str, Any]]) -> None:
     Raises:
         ValueError: If required fields are missing
     """
-    required_fields = {"audio", "text", "ref_audio"}
+    required_fields = {"audio", "text"}
     
     if not data:
         raise ValueError("Data is empty")
@@ -78,7 +78,7 @@ def validate_data_format(data: List[Dict[str, Any]]) -> None:
     if missing_fields:
         raise ValueError(
             f"Data is missing required fields: {missing_fields}. "
-            f"Each item must contain 'audio', 'text', and 'ref_audio'. "
+            f"Each item must contain 'audio', 'text'. "
             f"Available fields: {set(first_item.keys())}"
         )
 
