@@ -57,6 +57,79 @@ def load_data_from_source(input_source: str, split: str = "train") -> List[Dict[
                 f"Error: {str(e)}"
             )
 
+def map_huggingface_fields(data: List[Dict[str, Any]], field_mapping: Dict[str, str] = None) -> List[Dict[str, Any]]:
+    """
+    Map Hugging Face dataset fields to the required format.
+    
+    Args:
+        data: List of data dictionaries from Hugging Face
+        field_mapping: Dictionary mapping HF field names to required names
+                      e.g., {"audio_path": "audio", "transcript": "text"}
+    
+    Returns:
+        List of dictionaries with mapped field names
+    """
+    if field_mapping is None:
+        # Default mappings for common HF datasets
+        field_mapping = {
+            "audio": "audio",
+            "text": "text",
+            "transcript": "text",
+            "sentence": "text",
+            "wav": "audio",
+            "path": "audio",
+            "ref_audio": "ref_audio",
+            "reference_audio": "ref_audio",
+        }
+    
+    mapped_data = []
+    for item in data:
+        mapped_item = {}
+        
+        # Map audio field
+        audio_found = False
+        for hf_field, target_field in field_mapping.items():
+            if target_field == "audio" and hf_field in item:
+                mapped_item["audio"] = item[hf_field]
+                audio_found = True
+                break
+        
+        if not audio_found and "audio" in item:
+            mapped_item["audio"] = item["audio"]
+        
+        # Map text field
+        text_found = False
+        for hf_field, target_field in field_mapping.items():
+            if target_field == "text" and hf_field in item:
+                mapped_item["text"] = item[hf_field]
+                text_found = True
+                break
+        
+        if not text_found and "text" in item:
+            mapped_item["text"] = item["text"]
+        
+        # Map optional ref_audio field
+        ref_audio_found = False
+        for hf_field, target_field in field_mapping.items():
+            if target_field == "ref_audio" and hf_field in item:
+                mapped_item["ref_audio"] = item[hf_field]
+                ref_audio_found = True
+                break
+        
+        # If ref_audio not found, use audio as fallback
+        if not ref_audio_found:
+            mapped_item["ref_audio"] = mapped_item.get("audio", mapped_item.get("audio"))
+        
+        # Copy any additional fields that might be needed
+        for key in item.keys():
+            if key not in ["audio", "text", "transcript", "sentence", "wav", "path"]:
+                if key not in mapped_item:
+                    mapped_item[key] = item[key]
+        
+        mapped_data.append(mapped_item)
+    
+    return mapped_data
+
 def validate_data_format(data: List[Dict[str, Any]]) -> None:
     """
     Validate that the data has the required fields.
@@ -78,12 +151,13 @@ def validate_data_format(data: List[Dict[str, Any]]) -> None:
     if missing_fields:
         raise ValueError(
             f"Data is missing required fields: {missing_fields}. "
-            f"Each item must contain 'audio', 'text'. "
+            f"Each item must contain 'audio' and 'text'. "
             f"Available fields: {set(first_item.keys())}"
         )
 
 def prepare_data(input_source: str, output_jsonl: str, device: str, 
-                 tokenizer_model_path: str, split: str = "train") -> None:
+                 tokenizer_model_path: str, split: str = "train", 
+                 field_mapping: str = None) -> None:
     """
     Main function to prepare data by encoding audio files.
     
@@ -93,9 +167,21 @@ def prepare_data(input_source: str, output_jsonl: str, device: str,
         device: Device to use for tokenizer
         tokenizer_model_path: Path to the tokenizer model
         split: Dataset split to load (only for HF datasets)
+        field_mapping: JSON string with field mappings for HF datasets
     """
     # Load data
     total_lines = load_data_from_source(input_source, split)
+    
+    # Parse field mapping if provided
+    hf_field_mapping = None
+    if field_mapping:
+        try:
+            hf_field_mapping = json.loads(field_mapping)
+        except json.JSONDecodeError:
+            print("Warning: Invalid field_mapping JSON. Using default mappings.")
+    
+    # Map HuggingFace fields to required format
+    total_lines = map_huggingface_fields(total_lines, hf_field_mapping)
     
     # Validate format
     validate_data_format(total_lines)
@@ -183,6 +269,13 @@ def main():
         default="train",
         help="Dataset split to load when using Hugging Face datasets (default: train)"
     )
+    parser.add_argument(
+        "--field_mapping",
+        type=str,
+        default=None,
+        help='JSON string mapping HuggingFace field names to required names. '
+             'Example: \'{"audio_path": "audio", "transcript": "text"}\''
+    )
     
     args = parser.parse_args()
     
@@ -192,7 +285,8 @@ def main():
             output_jsonl=args.output_jsonl,
             device=args.device,
             tokenizer_model_path=args.tokenizer_model_path,
-            split=args.split
+            split=args.split,
+            field_mapping=args.field_mapping
         )
     except Exception as e:
         print(f"Error: {str(e)}")
