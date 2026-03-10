@@ -123,8 +123,10 @@ class TTSDataset(Dataset):
         audio_path  = item["audio"]
         text        = item["text"]
         audio_codes = item["audio_codes"]
-        language        = item.get('language','Auto')
-        ref_audio_path  = item['ref_audio']
+        language    = item.get('language', 'Auto')
+        
+        # Handle ref_audio with fallback to audio if not present
+        ref_audio_path = item.get('ref_audio', audio_path)
 
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
@@ -133,14 +135,14 @@ class TTSDataset(Dataset):
 
         ref_audio_list = self._ensure_list(ref_audio_path)
         normalized = self._normalize_audio_inputs(ref_audio_list)
-        wav,sr = normalized[0]
+        wav, sr = normalized[0]
 
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t
-            "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
+            "audio_codes": audio_codes,     # t, 16
+            "ref_mel": ref_mel
         }
         
     def collate_fn(self, batch):
