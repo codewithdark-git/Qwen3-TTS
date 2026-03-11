@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any
 
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 from qwen_tts import Qwen3TTSTokenizer
 
 BATCH_INFER_NUM = 32
@@ -46,6 +46,7 @@ def load_data_from_source(input_source: str, split: str = "train") -> List[Dict[
         print(f"Loading from Hugging Face dataset: {input_source} (split: {split})")
         try:
             dataset = load_dataset(input_source, split=split)
+            dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
             # Convert to list of dictionaries
             data = [dict(row) for row in dataset]
             print(f"Loaded {len(data)} samples from Hugging Face dataset")
@@ -210,7 +211,7 @@ def prepare_data(input_source: str, output_jsonl: str, device: str,
         batch_audios.append(line['audio'])
         
         if len(batch_lines) >= BATCH_INFER_NUM:
-            enc_res = tokenizer_12hz.encode(batch_audios)
+            enc_res = tokenizer_12hz.encode(batch_audios, sr=16000)
             for code, batch_line in zip(enc_res.audio_codes, batch_lines):
                 batch_line['audio_codes'] = code.cpu().tolist()
                 final_lines.append(batch_line)
