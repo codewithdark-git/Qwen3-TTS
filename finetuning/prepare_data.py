@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import json
 import numpy as np
@@ -29,25 +33,47 @@ BATCH_INFER_NUM = 32
 
 def normalize_audio(audio):
     """
-    Convert any audio format to numpy waveform.
-    Supports:
-    - HuggingFace Audio dict
+    Convert any supported audio input to a numpy float32 waveform.
+    Handles:
+    - HuggingFace AudioDecoder
+    - HuggingFace audio dict
+    - torch tensors
     - numpy arrays
     - file paths
     """
 
-    if isinstance(audio, dict) and "array" in audio:
-        return audio["array"]
+    import numpy as np
+    import soundfile as sf
 
-    if isinstance(audio, np.ndarray):
-        return audio
+    # HuggingFace lazy AudioDecoder
+    if hasattr(audio, "get_all_samples"):
+        decoded = audio.get_all_samples()
+        audio = decoded.data
 
-    if isinstance(audio, str):
-        wav, _ = sf.read(audio)
-        return wav
+    # HuggingFace dict format
+    elif isinstance(audio, dict) and "array" in audio:
+        audio = audio["array"]
 
-    raise TypeError(f"Unsupported audio format: {type(audio)}")
+    # File path
+    elif isinstance(audio, str):
+        audio, _ = sf.read(audio)
 
+    # Torch tensor → numpy
+    try:
+        import torch
+        if isinstance(audio, torch.Tensor):
+            audio = audio.cpu().numpy()
+    except:
+        pass
+
+    # Convert lists to numpy
+    if not isinstance(audio, np.ndarray):
+        audio = np.array(audio)
+
+    # Ensure correct dtype
+    audio = audio.astype(np.float32)
+
+    return audio
 
 def load_data_from_source(input_source: str, split: str = "train") -> List[Dict[str, Any]]:
     """
@@ -201,8 +227,12 @@ def prepare_data(
     with open(output_jsonl, "w") as f:
 
         for line in final_lines:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+          output = {
+              "text": line["text"],
+              "audio_codes": line["audio_codes"]
+          }
 
+        f.write(json.dumps(output, ensure_ascii=False) + "\n")
     print("Data preparation complete!")
 
 
@@ -254,7 +284,6 @@ def main():
         split=args.split,
         field_mapping=args.field_mapping,
     )
-
 
 if __name__ == "__main__":
     main()
