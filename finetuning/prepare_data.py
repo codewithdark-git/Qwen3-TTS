@@ -18,6 +18,10 @@
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
 
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import json
 import numpy as np
@@ -227,12 +231,22 @@ def prepare_data(
     with open(output_jsonl, "w") as f:
 
         for line in final_lines:
+
+          audio_obj = line["audio"]
+
+          # Convert AudioDecoder → file path or waveform
+          if hasattr(audio_obj, "path"):
+              audio_path = audio_obj.path
+          else:
+              audio_path = None
+
           output = {
               "text": line["text"],
+              "audio": audio_path,
               "audio_codes": line["audio_codes"]
           }
 
-        f.write(json.dumps(output, ensure_ascii=False) + "\n")
+          f.write(json.dumps(output, ensure_ascii=False) + "\n")
     print("Data preparation complete!")
 
 
