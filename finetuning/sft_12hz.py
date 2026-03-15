@@ -23,11 +23,12 @@ from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 target_speaker_embedding = None
+
+
 def train():
     global target_speaker_embedding
 
@@ -35,13 +36,19 @@ def train():
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--grad_accum", type=int, default=8)
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.grad_accum,
+        mixed_precision="bf16",
+    )
 
     MODEL_PATH = args.init_model_path
 
@@ -51,13 +58,62 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
+    # FIX: detach speaker_encoder from the model BEFORE accelerate.prepare.
+    # accelerate.prepare moves every sub-module of the model it receives to
+    # the target device (GPU).  By popping speaker_encoder out and keeping it
+    # as a standalone CPU module we prevent prepare from touching it at all.
+    speaker_encoder = qwen3tts.model.speaker_encoder.cpu().eval()
+    # Replace with a no-op Identity so model.speaker_encoder calls are safe
+    # (they won't be reached in our training loop, but just in case).
+    qwen3tts.model.speaker_encoder = torch.nn.Identity()
+
+    # Disable gradients for speaker_encoder permanently — we never train it.
+    for p in speaker_encoder.parameters():
+        p.requires_grad_(False)
+
+    # Enable gradient checkpointing to save activation memory (~50% savings).
+    if hasattr(qwen3tts.model.talker, "gradient_checkpointing_enable"):
+        qwen3tts.model.talker.gradient_checkpointing_enable()
+    elif hasattr(qwen3tts.model.talker, "model") and hasattr(
+        qwen3tts.model.talker.model, "gradient_checkpointing_enable"
+    ):
+        qwen3tts.model.talker.model.gradient_checkpointing_enable()
+
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=dataset.collate_fn,
+        num_workers=2,
+        pin_memory=False,
+    )
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    # 8-bit AdamW halves optimizer state memory vs fp32 AdamW.
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            qwen3tts.model.talker.parameters(),
+            lr=args.lr,
+            weight_decay=0.01,
+        )
+        if accelerator.is_main_process:
+            print("Using 8-bit AdamW (bitsandbytes)")
+    except ImportError:
+        from torch.optim import AdamW
+        optimizer = AdamW(
+            qwen3tts.model.talker.parameters(),
+            lr=args.lr,
+            weight_decay=0.01,
+        )
+        if accelerator.is_main_process:
+            print("bitsandbytes not found — using standard AdamW. "
+                  "Install with: pip install bitsandbytes")
 
+    # prepare only moves qwen3tts.model (which no longer contains
+    # speaker_encoder) to GPU.  speaker_encoder stays on CPU.
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
@@ -69,30 +125,38 @@ def train():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
-                input_ids = batch['input_ids']
-                codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
-                text_embedding_mask = batch['text_embedding_mask']
-                codec_embedding_mask = batch['codec_embedding_mask']
-                attention_mask = batch['attention_mask']
-                codec_0_labels = batch['codec_0_labels']
-                codec_mask = batch['codec_mask']
+                input_ids            = batch["input_ids"]
+                codec_ids            = batch["codec_ids"]
+                ref_mels             = batch["ref_mels"]
+                text_embedding_mask  = batch["text_embedding_mask"]
+                codec_embedding_mask = batch["codec_embedding_mask"]
+                attention_mask       = batch["attention_mask"]
+                codec_0_labels       = batch["codec_0_labels"]
+                codec_mask           = batch["codec_mask"]
 
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                # speaker_encoder is a standalone CPU module — feed it CPU
+                # tensors and only send the tiny output embedding to GPU.
+                with torch.no_grad():
+                    speaker_embedding = speaker_encoder(
+                        ref_mels.cpu().to(torch.bfloat16)
+                    ).to(accelerator.device).to(model.dtype)
+
                 if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
+                    target_speaker_embedding = speaker_embedding.detach().cpu()
 
-                input_text_ids = input_ids[:, :, 0]
+                input_text_ids  = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+                input_text_embedding  = model.talker.model.text_embedding(input_text_ids)  * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
                 for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](
+                        codec_ids[:, :, i]
+                    )
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
@@ -100,14 +164,16 @@ def train():
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
+                    output_hidden_states=True,
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
                 talker_hidden_states = hidden_states[codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(
+                    talker_codec_ids, talker_hidden_states
+                )
 
                 loss = outputs.loss + 0.3 * sub_talker_loss
 
@@ -119,42 +185,52 @@ def train():
                 optimizer.step()
                 optimizer.zero_grad()
 
+                del input_text_embedding, input_codec_embedding, input_embeddings
+                del hidden_states, talker_hidden_states
+                torch.cuda.empty_cache()
+
             if step % 10 == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+                accelerator.print(
+                    f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}"
+                )
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
             shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
+            input_config_file  = os.path.join(MODEL_PATH, "config.json")
+            output_config_file = os.path.join(output_dir,  "config.json")
+            with open(input_config_file, "r", encoding="utf-8") as f:
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
-                args.speaker_name: 3000
-            }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
+            talker_config["spk_id"] = {args.speaker_name: 3000}
+            talker_config["spk_is_dialect"] = {args.speaker_name: False}
             config_dict["talker_config"] = talker_config
-
-            with open(output_config_file, 'w', encoding='utf-8') as f:
+            with open(output_config_file, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
             unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+            state_dict = {
+                k: v.detach().to("cpu")
+                for k, v in unwrapped_model.state_dict().items()
+            }
 
+            # Drop the Identity placeholder we put in place of speaker_encoder
             drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
+            for k in [k for k in state_dict if k.startswith(drop_prefix)]:
                 del state_dict[k]
 
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+            weight = state_dict["talker.model.codec_embedding.weight"]
+            state_dict["talker.model.codec_embedding.weight"][3000] = (
+                target_speaker_embedding[0]
+                .detach()
+                .to(weight.device)
+                .to(weight.dtype)
+            )
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
+
 
 if __name__ == "__main__":
     train()
